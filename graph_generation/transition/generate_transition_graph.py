@@ -11,6 +11,7 @@ import MySQLdb
 import numpy as np
 from pyspark import SparkContext
 
+from mysql_util import Connector
 from quantization import Quantizer
 
 # Outline
@@ -20,7 +21,7 @@ from quantization import Quantizer
 # Add that to kxk matrix
 # Once we're done calculate transition matrix and write to output.json
 
-NEAREST_NODE_TOLERANCE = 0.5 # If dest or origin is greater than this distance in km, throw trip away
+NEAREST_NODE_TOLERANCE = 0.2 # If dest or origin is greater than this distance in km, throw trip away
 
 
 def map_row(row, pu_time_index, interval_length):
@@ -33,8 +34,28 @@ def map_row(row, pu_time_index, interval_length):
         return None
 
 
-def generate_trip_graph(entry, header, connector):
-    quantizer = Quantizer(connector)
+def filter_trip_graph(entry, transition_group_id, interval_length):
+    interval_index = entry[0]
+
+    interval_start = interval_length * interval_index
+    interval_end = interval_start + interval_length
+
+    with connector.open() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM transition_graph where transition_group_id=%s '
+                       'AND interval_start=%s AND interval_end=%s',
+                       (transition_group_id, interval_start, interval_end))
+        if (cursor.fetchone() is not None):
+            sys.stderr.write('Warning: transition grpah already exists in transition group {} for interval {} to {}: '
+                             'Skipping this interval.\n'
+                             .format(transition_group_id, interval_start, interval_end))
+            return False
+
+        conn.commit()
+    return True
+
+
+def generate_trip_graph(entry, header, quanitzer, connector):
     trip_graph = np.zeros((quantizer.num_nodes(), quantizer.num_nodes()), dtype=np.int)
 
     pu_lat_index = header.index('pickup_latitude')
@@ -66,11 +87,10 @@ def generate_trip_graph(entry, header, connector):
     return key, trip_graph
 
 
-def write_trip_graph(entry, transition_group_id, interval_length, connector):
+def write_trip_graph(entry, transition_group_id, interval_length, quantizer, connector):
     interval_index = entry[0]
     trip_graph = entry[1]
 
-    quantizer = Quantizer(connector)
     # outbound_degrees = trip_graph.sum(axis = 1)
     # transition_probabilities = trip_graph.astype(np.float) / outbound_degrees[:, np.newaxis]
     # transition_probabilities = np.nan_to_num(transition_probabilities) # Replace nans with 0's
@@ -93,22 +113,27 @@ def write_trip_graph(entry, transition_group_id, interval_length, connector):
 
     try:
         with connector.open() as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO transition_graph (transition_group_id, interval_start, interval_end) '
-                         'values (%s,%s,%s)', transition_graph_row)
-            transition_graph_id = cursor.lastrowid
+            try:
+                cursor = conn.cursor()
+                cursor.execute('INSERT INTO transition_graph (transition_group_id, interval_start, interval_end) '
+                             'values (%s,%s,%s)', transition_graph_row)
+                transition_graph_id = cursor.lastrowid
 
-            l_edges = [(transition_graph_id,) + edge for edge in l_edges]
+                l_edges = [(transition_graph_id,) + edge for edge in l_edges]
 
-            cursor.executemany('INSERT INTO transition_edge (transition_graph_id, '
-                             'src_node_id, dest_node_id, weight)'
-                             'values (%s,%s,%s,%s)', l_edges)
-
-            conn.commit()
-    except (MySQLdb.IntegrityError, ValueError):
+                cursor.executemany('INSERT INTO transition_edge (transition_graph_id, '
+                                 'src_node_id, dest_node_id, weight)'
+                                 'values (%s,%s,%s,%s)', l_edges)
+                conn.commit()
+            except:
+                import traceback
+                sys.stderr.write('Error when writing graph to transition group {} for interval {} to {}:\n{}\n'
+                                 .format(transition_group_id, interval_start, interval_end, traceback.format_exc()))
+                conn.rollback()
+    except MySQLdb.Error:
         import traceback
-        sys.stderr.write('Error when writing graph to transition group {} for interval {} to {}:\n{}\n'
-                         .format(transition_group_id, interval_start, interval_end, traceback.format_exc()))
+        sys.stderr.write('Could not connect to database:\n{}\n'
+                         .format(traceback.format_exc()))
 
 
 def _get_transition_group_id(transition_group_name, connector):
@@ -153,18 +178,20 @@ def _get_transition_group_id(transition_group_name, connector):
 
 
 if __name__ == '__main__':
-    from graph_generation.mysql_util import Connector
+    argv = sys.argv
 
-    interval_length = int(sys.argv[1])
+    interval_length = int(argv[1])
 
-    data_path = sys.argv[2]
-    if os.path.isfile(data_path):
-        data_files = [data_path]
-    elif os.path.isdir(data_path):
+    data_path = argv[2]
+    # if os.path.isfile(data_path):
+    #     data_files = [data_path]
+    if os.path.isdir(data_path):
         data_files = [os.path.join(data_path, data_file_name) for data_file_name in os.listdir(data_path)]
         data_files = [data_file for data_file in data_files if os.path.isfile(data_file)]
     else:
-        raise ValueError('{} is not a valid file path'.format(data_path))
+        data_files = [data_path]
+    # else:
+    #     raise ValueError('{} is not a valid file path'.format(data_path))
 
 
     script_dir = os.path.split(os.path.realpath(__file__))[0]
@@ -172,6 +199,7 @@ if __name__ == '__main__':
 
     connector = Connector(os.path.join(script_dir, '../credentials.txt'))
     quantizer = Quantizer(connector)
+    sc = SparkContext(appName='transition_graph')
 
     for data_file in data_files:
         transition_file_name = os.path.split(data_file)[1]
@@ -179,7 +207,6 @@ if __name__ == '__main__':
 
         transition_group_id = _get_transition_group_id(transition_group_name, connector)
 
-        sc = SparkContext("local", "Transition Graph", pyFiles=pyFiles)
         taxi_data = sc.textFile(data_file) \
             .map(lambda row: row.split(',')) \
             .filter(lambda row: len(row) > 1)
@@ -196,6 +223,7 @@ if __name__ == '__main__':
             .map(lambda row: map_row(row, pu_time_index, interval_length)) \
             .filter(lambda row: row is not None) \
             .groupByKey() \
-            .map(lambda entry: generate_trip_graph(entry, header, connector)) \
-            .map(lambda entry: write_trip_graph(entry, transition_group_id, interval_length, connector)) \
+            .filter(lambda entry: filter_trip_graph(entry, transition_group_id, interval_length)) \
+            .map(lambda entry: generate_trip_graph(entry, header, quantizer, connector)) \
+            .map(lambda entry: write_trip_graph(entry, transition_group_id, interval_length, quantizer, connector)) \
             .collect()
